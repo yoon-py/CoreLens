@@ -18,6 +18,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python tests/test_build.py
       - run: python tests/test_insights.py
+      - run: python tests/test_mcp.py
 
   ui:
     runs-on: ubuntu-latest

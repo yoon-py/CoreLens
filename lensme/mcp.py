@@ -1,12 +1,14 @@
 """MCP server over stdio: agents query the ontology for architecture context.
 
 Zero-dependency JSON-RPC loop (MCP stdio transport is newline-delimited
-JSON-RPC 2.0). Exposes four tools over a built ontology.json:
+JSON-RPC 2.0). Exposes five tools over a built ontology.json:
 
-  overview   - the Product > Feature > Component tree with stats
-  search     - find any node by name/path, with its ownership chain
-  component  - full detail for one component (files, relationships, impact)
-  impact     - "if I modify X, what is affected?"
+  get_context - task-scoped bundle (files, symbols, deps, blast radius) in one
+                call, trimmed to a token budget - replaces ls/grep exploration
+  overview    - the Product > Feature > Component tree with stats
+  search      - find any node by name/path, with its ownership chain
+  component   - full detail for one component (files, relationships, impact)
+  impact      - "if I modify X, what is affected?"
 
 Run: lensme mcp [--ontology graphify-out/ontology.json]
 Register (Claude Code): claude mcp add lensme -- lensme mcp --ontology /abs/path/ontology.json
@@ -14,6 +16,7 @@ Register (Claude Code): claude mcp add lensme -- lensme mcp --ontology /abs/path
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -167,7 +170,109 @@ def tool_impact(onto: Onto, args: dict) -> dict:
     }
 
 
+def _est_tokens(obj) -> int:
+    return len(json.dumps(obj, ensure_ascii=False)) // 4  # ~4 chars/token heuristic
+
+
+def _task_words(task: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9_]+", task.lower()) if len(w) > 2]
+
+
+def _file_score(f: dict, words: list[str]) -> int:
+    path = (f.get("path") or f["name"]).lower()
+    score = sum(3 for w in words if w in path)
+    score += sum(1 for w in words for s in f.get("symbols", []) if w in s["name"].lower())
+    return score
+
+
+def tool_get_context(onto: Onto, args: dict) -> dict:
+    """Task-scoped context bundle: the one MCP call that replaces an agent's
+    ls/grep/read exploration walk. Everything is ranked against the task words
+    and trimmed to a token budget."""
+    task = args.get("task", "")
+    words = _task_words(task)
+    budget = int(args.get("budget", 2000))
+    d = onto.data()
+
+    comp = _resolve_component(onto, args["component"]) if args.get("component") else None
+    ranked_comps: list[tuple[bool, int, dict, list[dict]]] = []
+    for e in onto.index().values():
+        n = e["node"]
+        if n["type"] != "Component":
+            continue
+        files: list[dict] = []
+
+        def collect(x: dict) -> None:
+            if x["type"] == "File":
+                files.append(x)
+            for c in x.get("children", []):
+                collect(c)
+
+        collect(n)
+        head = (n["name"] + " " + n.get("description", "")).lower()
+        score = sum(5 for w in words if w in head) + sum(_file_score(f, words) for f in files)
+        # docs/tests/examples bands answer "where is X documented", never
+        # "where is X implemented" - any matching source component wins first
+        support = any(a.get("kind") == "support" for a in e["chain"])
+        ranked_comps.append((support, score, n, files))
+    ranked_comps.sort(key=lambda t: (t[0], -t[1]))
+
+    if comp is None:
+        if not words:
+            return {"error": "pass a task description and/or a component name"}
+        matching = [t for t in ranked_comps if t[1] > 0]
+        if not matching:
+            return {"error": f"nothing matches task {task!r} - try the search tool"}
+        comp = matching[0][2]
+    files = next(fl for _, s, c, fl in ranked_comps if c["id"] == comp["id"])
+
+    files_out = [
+        {"path": f.get("path") or f["name"], "loc": f.get("loc"),
+         "symbols": [{"name": s["name"], "line": s.get("line")} for s in f.get("symbols", [])]}
+        for f in sorted(files, key=lambda f: (-_file_score(f, words), -(f.get("loc") or 0)))
+    ]
+    rels = d.get("component_relationships", [])
+    chain = onto.index()[comp["id"]]["chain"]
+    out = {
+        "task": task,
+        "component": {**_brief(comp),
+                      "owned_by": [a["name"] for a in chain if a["type"] != "Product"]},
+        "responsibilities": comp.get("responsibilities", []),
+        "read_first": [f["path"] for f in files_out[:3]],
+        "files": files_out,
+        "depends_on": sorted({onto.name_of(r["target"]) for r in rels
+                              if r["source"] == comp["id"]}),
+        "dependents": sorted({onto.name_of(r["source"]) for r in rels
+                              if r["target"] == comp["id"]}),
+        "other_candidates": [c["name"] for _, s, c, _ in ranked_comps[:4]
+                             if s > 0 and c["id"] != comp["id"]],
+    }
+    imp = d.get("impact", {}).get(comp["id"])
+    if imp:
+        out["impact_if_modified"] = {
+            "directly_affects": [onto.name_of(i) for i in imp["direct"]],
+            "total_files": imp["total_files"],
+        }
+
+    # trim to budget: drop symbols from least-relevant files first, then the files
+    while _est_tokens(out) > budget and any(f["symbols"] for f in out["files"]):
+        next(f for f in reversed(out["files"]) if f["symbols"])["symbols"] = []
+    while _est_tokens(out) > budget and len(out["files"]) > 3:
+        out["files"].pop()
+    out["budget"] = {"requested_tokens": budget, "estimated_tokens": _est_tokens(out)}
+    return out
+
+
 TOOLS = {
+    "get_context": (tool_get_context, "Task-scoped context bundle in ONE call: the owning component, ranked files with symbols, read-first suggestions, dependencies/dependents, and blast radius - trimmed to a token budget. Use this INSTEAD of exploring with ls/grep/find when starting a task.", {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string", "description": "what you are trying to do, in a few words (e.g. 'fix oauth2 scope validation')"},
+            "component": {"type": "string", "description": "optional: component name/id if already known"},
+            "budget": {"type": "number", "description": "approx token budget for the reply (default 2000)"},
+        },
+        "required": [],
+    }),
     "overview": (tool_overview, "Architecture overview: the Product > Feature > Component tree with stats and descriptions. Start here.", {
         "type": "object", "properties": {}, "required": [],
     }),

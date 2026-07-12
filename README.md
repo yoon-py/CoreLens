@@ -51,7 +51,7 @@ automatically and the browser picks it up within seconds.
 | `lensme serve [--watch] [--port N]` | serve UI + ontology.json (+ graph.html, hotspots.json), open browser |
 | `lensme symbols --prefix p/ [--changed]` | per-file symbol digest for agent enrichment (hash-cached) |
 | `lensme tree ontology.json` | pretty-print an ontology |
-| `lensme mcp [--ontology o.json]` | MCP server (stdio, zero-dep): `overview` / `search` / `component` / `impact` tools for agents |
+| `lensme mcp [--ontology o.json]` | MCP server (stdio, zero-dep): `get_context` / `overview` / `search` / `component` / `impact` tools for agents |
 | `lensme impact-check [--repo r] [--files ...]` | blast radius of staged files - informational, never blocks; `--install-hook` writes a pre-commit hook |
 | `lensme hotspots [--repo r] [--since "6 months ago"]` | git churn + co-change joined onto the ontology; flags co-changed pairs with **no** structural edge (hidden coupling); feeds the UI heatmap |
 | `lensme diff old.json new.json [--json]` | structural diff: components/files added/removed, relationship count deltas, blast-radius changes - the engine for PR architecture reports |
@@ -107,6 +107,26 @@ Properties tab:
   "impact": { "<component_id>": { "direct": [...], "indirect": [...], "total_files": N } }
 }
 ```
+
+## Agent token savings
+
+`get_context` gives a coding agent its starting context in one MCP call -
+the owning component, files ranked by task relevance with their symbols,
+read-first suggestions, dependencies, and blast radius, trimmed to a token
+budget. Source components always outrank docs/tests bands.
+
+Measured on FastAPI for the task "oauth2 security scopes"
+(`python examples/bench_context.py <repo> <ontology.json> "<task>"`):
+
+| exploration strategy | tokens |
+|---|---|
+| ls + grep (905 hits) + read top-3 grep candidates | 48,961 |
+| one `get_context` call + read the suggested file | 8,008 |
+
+**84% fewer exploration tokens**, and the baseline walk still doesn't know the
+blast radius (1,165 files) that `get_context` includes. The ontology saves the
+*search* tokens, not the final read: it tells the agent which 1 file to read
+instead of which 30 to sift.
 
 ## Validated against external repos
 
