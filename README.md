@@ -117,18 +117,29 @@ the owning component, files ranked by task relevance with their symbols,
 read-first suggestions, dependencies, and blast radius, trimmed to a token
 budget. Source components always outrank docs/tests bands.
 
-Measured on FastAPI for the task "oauth2 security scopes"
-(`python examples/bench_context.py <repo> <ontology.json> "<task>"`):
+Measured on FastAPI across 5 tasks, baseline = ls + grep + read the top-3 grep
+candidates, lensme = one `get_context` call + read the suggested file
+(`python examples/bench_context.py <repo> <ontology.json> "<task>"`,
+chars/4 token estimate - directional, not tokenizer-exact):
 
-| exploration strategy | tokens |
-|---|---|
-| ls + grep (905 hits) + read top-3 grep candidates | 48,961 |
-| one `get_context` call + read the suggested file | 8,008 |
+| task | baseline tokens | lensme tokens | reduction |
+|---|---|---|---|
+| oauth2 security scopes | 48,961 | 8,008 | 84% |
+| dependency injection | 31,635 | 11,880 | 62% |
+| websocket support | 91,693 | 65,139 | 29% |
+| background tasks | 27,244 | 2,132 | 92% |
+| response model validation | 571,901 | 5,893 | 99% |
 
-**84% fewer exploration tokens**, and the baseline walk still doesn't know the
-blast radius (1,165 files) that `get_context` includes. The ontology saves the
-*search* tokens, not the final read: it tells the agent which 1 file to read
-instead of which 30 to sift.
+**Reduction ranges 29-99%, not a fixed multiplier**, and the two ends explain
+why: the 99% case has a baseline that explodes because "response"/"model" are
+common words that grep-hit deep into the docs corpus, not because lensme did
+anything special. The 29% case is the honest floor - `routing.py` (the
+correct answer) is itself a 63k-token file, so once found, its content
+dominates both strategies' totals and exploration savings barely move the
+needle. Either way `get_context` also returns the blast radius, which the
+baseline walk never computes. Small sample (5 tasks, 1 repo, one author for
+both the tool and the benchmark) - `examples/bench_context.py` is the whole
+methodology, run it on your own repo rather than trusting a single number.
 
 ## Validated against external repos
 
