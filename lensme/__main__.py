@@ -64,6 +64,7 @@ def cmd_build(args) -> None:
         "graph": args.graph, "prefix": args.prefix, "root": args.root,
         "name": args.name, "description": args.description,
         "enrichment": args.enrichment, "output": args.output,
+        "engine": args.engine,
     }
     onto = _run_build(cfg)
     # persist config so `lensme sync` / `lensme serve --watch` can rebuild
@@ -105,6 +106,21 @@ def cmd_sync(args) -> None:
         print("\nstopped")
 
 
+def _code_graph_source(build_engine: str | None, graph_html_exists: bool, has_cbm_root: bool) -> str:
+    """Decide what the Code Graph tab should show: 'iframe' (graphify's
+    graph.html), 'cbm' (launch cbm's live 3D UI), or 'none'.
+
+    build_engine is explicit (set by `scan`/`build --engine`) and always wins
+    over guessing from file existence - a stray graph.html left by an
+    unrelated graphify run must never outrank the engine that actually built
+    the current ontology.json. build_engine=None (config predates this field)
+    falls back to the old file-existence probe for backward compatibility.
+    """
+    if build_engine == "graphify" or (build_engine is None and graph_html_exists):
+        return "iframe" if graph_html_exists else "none"
+    return "cbm" if has_cbm_root else "none"
+
+
 def _ui_dist() -> Path | None:
     """Locate the built UI. Checks packaged assets first, then the repo layout."""
     for cand in (
@@ -130,9 +146,14 @@ def cmd_serve(args) -> None:
     graph_html = onto_path.parent / "graph.html"  # graphify's raw code graph (Code Graph tab)
     hotspots_path = onto_path.parent / "hotspots.json"  # optional: `lensme hotspots` output
     try:
-        cbm_root = _load_config(args.graph).get("root")
+        _build_cfg = _load_config(args.graph)
     except SystemExit:
-        cbm_root = None
+        _build_cfg = {}
+    cbm_root = _build_cfg.get("root")
+    # "engine" is explicit (set by `scan`/`build`) - trust it over guessing from
+    # file existence: an unrelated/stale graph.html sitting next to a cbm-built
+    # ontology.json must NOT silently win and show stale, mismatched data.
+    build_engine = _build_cfg.get("engine")  # None on configs written before this field existed
     cbm_ui: dict = {}  # lazily filled: {"proc": Popen, "url": str} on first /api/code-graph hit
     # injected when serving graph.html: ?q=<label> focuses the matching node using
     # the globals graphify's page already exposes (RAW_NODES, focusNode)
@@ -151,12 +172,10 @@ def cmd_serve(args) -> None:
 </script></body>"""
 
     def _code_graph_info() -> dict:
-        """graph.html (graphify, embeddable) if it exists; else try cbm's live
-        3D UI (a separate server - its CSP sends frame-ancestors 'none', so the
-        frontend opens it in a new tab instead of iframing it)."""
-        if graph_html.exists():
+        source = _code_graph_source(build_engine, graph_html.exists(), bool(cbm_root))
+        if source == "iframe":
             return {"type": "iframe", "url": "/graph.html"}
-        if not cbm_root:
+        if source == "none":
             return {"type": "none"}
         if "proc" not in cbm_ui:
             try:
@@ -285,6 +304,7 @@ def cmd_scan(args) -> None:
         "graph": str(graph), "prefix": "", "root": str(root),
         "name": args.name or root.name, "description": "",
         "enrichment": None, "output": str(graph.parent / "ontology.json"),
+        "engine": args.engine,
     }
     _run_build(cfg)
     _config_path(str(graph)).write_text(
@@ -304,7 +324,7 @@ def cmd_cbm(args) -> None:
         root, out, cbm_bin=args.cbm_bin, reindex=args.reindex, mode=args.mode
     )
     print(f"wrote {out} (cbm project {project}: {stats['nodes']} nodes, {stats['edges']} edges)")
-    print(f"next: lensme build --graph {out} --name {root.name} [--prefix p/]")
+    print(f"next: lensme build --graph {out} --name {root.name} --engine cbm [--prefix p/]")
 
 
 def cmd_report(args) -> None:
@@ -556,6 +576,10 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--enrichment", default=None, help="agent-authored enrichment JSON (see symbols cmd)")
     b.add_argument("-o", "--output", default="graphify-out/ontology.json")
     b.add_argument("--tree", action="store_true", help="print the tree after writing")
+    b.add_argument("--engine", choices=["graphify", "cbm"], default="graphify",
+                   help="which engine produced --graph (default: graphify) - "
+                        "pass cbm if you ran `lensme cbm` first, so `lensme serve` "
+                        "knows to launch cbm's UI for Code Graph instead of graph.html")
     b.set_defaults(fn=cmd_build)
 
     sy = sub.add_parser("sync", parents=[common],
